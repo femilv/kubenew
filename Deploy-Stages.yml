@@ -1,0 +1,113 @@
+# AKS-Stages
+# REQUIRES:
+# - resources.repositories.repository: template - ReleaseMgmt/BuildTemplates defined in root .yml
+# - resources.repositories.repository: dbascripts - TIO/dbascripts defined in root .yml
+# Parameters:
+# parameters.BuildParent
+# parameters.SmtpTo
+# parameters.SmtpSub
+# parameters.BuildServerRoot
+
+parameters:
+# Allows developer to choose an ADO Deployment Environment of their own
+- name: devTargetADOEnv
+  displayName: 'Target ADO Environment'
+  type: string
+  default: development
+- name: testTargetADOEnv
+  displayName: 'Target ADO Environment'
+  type: string
+  default: test
+- name: preprodTargetADOEnv
+  displayName: 'Target ADO Environment'
+  type: string
+  default: preprod
+- name: prodTargetADOEnv
+  displayName: 'Target ADO Environment'
+  type: string
+  default: production
+
+# Allow Developer to specify separate build.yml configs for each environment
+# Default is same for all environments since likely the build config will be same in all
+- name: devBuildConfig
+  displayName: Dev build.yml config file
+  type: string
+  default: .geha/build.yml
+- name: testBuildConfig
+  displayName: Test build.yml config file
+  type: string
+  default: .geha/build.yml
+- name: preprodBuildConfig
+  displayName: Stage build.yml config file
+  type: string
+  default: .geha/build.yml
+- name: prodBuildConfig
+  displayName: Prod build.yml config file
+  type: string
+  default: .geha/build.yml
+
+# Allow Developer to specify separate values file for each environment
+- name: devValuesFile
+  displayName: Dev values.yml file
+  type: string
+  default: .geha/dev-values.yml
+- name: testValuesFile
+  displayName: Test values.yml file
+  type: string
+  default: .geha/test-values.yml
+- name: preprodValuesFile
+  displayName: Stage values.yml file
+  type: string
+  default: .geha/stage-values.yml
+- name: prodValuesFile
+  displayName: Prod values.yml file
+  type: string
+  default: .geha/prod-values.yml
+
+# Allow person using template to chose which AKS environments to deploy to. 
+# Default will create a stage for dev, test, stage and prod. 
+- name: AKSEnvironments
+  type: object
+  default: ['dev', 'test', 'stage', 'prod']
+
+stages:
+- ${{ if containsValue(parameters.AKSEnvironments, 'dev')}}:
+  - template: Deploy-Stage.yml
+    parameters:
+      targetEnv: ${{ parameters.devTargetADOEnv }}
+      envShortHand: dev
+      aksClusterName: geha-dev-aks
+      resourceGroup: rg-aks-dev-01
+      image_repo: gehadev
+      valuesFile: ${{ parameters.devValuesFile }}
+      buildConfig: ${{ parameters.devBuildConfig }}
+- ${{ if containsValue(parameters.AKSEnvironments, 'test')}}:
+  - template: Deploy-Stage.yml
+    parameters:
+      targetEnv: ${{ parameters.testTargetADOEnv }}
+      envShortHand: test
+      aksClusterName: geha-tst-aks
+      resourceGroup: rg-aks-tst-01
+      image_repo: gehadev
+      valuesFile: ${{ parameters.testValuesFile }}
+      buildConfig: ${{ parameters.testBuildConfig }}
+- ${{ if containsValue(parameters.AKSEnvironments, 'stage')}}:
+  - template: Deploy-Stage.yml
+    parameters:
+      targetEnv: ${{ parameters.preprodTargetADOEnv }}
+      envShortHand: stage
+      aksClusterName: geha-stg-aks
+      resourceGroup: rg-aks-stg-01
+      image_repo: gehadev
+      valuesFile: ${{ parameters.preprodValuesFile }}
+      buildConfig: ${{ parameters.preprodBuildConfig }}
+- ${{ if containsValue(parameters.AKSEnvironments, 'prod')}}:
+  - template: Deploy-Stage.yml
+    parameters:
+      targetEnv: ${{ parameters.prodTargetADOEnv }}
+      envShortHand: prod
+      aksClusterName: geha-prd-aks
+      resourceGroup: rg-aks-prd-01
+      image_repo: gehaprd
+      valuesFile: ${{ parameters.prodValuesFile }}
+      buildConfig: ${{ parameters.prodBuildConfig }}
