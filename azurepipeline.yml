@@ -1,0 +1,158 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- develop
+
+variables:
+  - group: FontAwesome
+  - group: AquaSecurity
+  - name: dockerfile
+    value: Dockerfile
+  - name: major
+    value: 0
+  - name: minor
+    value: 1
+  - name: patch
+    value: $(Build.BuildNumber)
+  - name: appName
+    value: member-portal
+  - template: AKS-vars.yml@templates
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: ReleaseMgmt/BuildTemplates
+      ref:  refs/tags/V1.1.0
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: build
+  displayName: Build Package
+  jobs:
+  - job: PRbuild
+    displayName: PR Validation
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    steps:
+    - task: NodeTool@0
+      inputs:
+          versionSpec: '>=16.13.1'
+      displayName: 'Install Node.js and build'
+    - script: |
+        npm config set "@fortawesome:registry" https://npm.fontawesome.com/
+        npm config set "//npm.fontawesome.com/:_authToken" "$(fatoken)"
+        npm install-ci-test
+        npm run build
+      displayName: Install dependencies and run tests and build
+      workingDirectory: $(Build.Repository.LocalPath)
+  - job: package
+    displayName: Build and Publish Docker Image
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    steps:
+      - powershell: |
+          $version = "$(major).$(minor).$(patch)"
+          Write-Host "##vso[task.setvariable variable=version;isOutput=true]$version"
+          Write-Host "Version: $version"
+          $packageinfo = @{
+            version = "$version"
+            name = "$(appName)"
+            image = "$(imageName)"
+          } | ConvertTo-Json | Out-File "$(Build.ArtifactStagingDirectory)/info.json"
+        name: info
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/info.json
+          artifactName: PackageInfo
+     
+      - task: NodeTool@0
+        inputs:
+            versionSpec: '>=16.13.1'
+        displayName: 'Install Node.js'
+      - script: |
+          npm config set "@fortawesome:registry" https://npm.fontawesome.com/
+          npm config set "//npm.fontawesome.com/:_authToken" "$(fatoken)"
+          npm version "$(info.version)"
+          Write-Host "##[command]npm install"
+          npm install
+          Write-Host "##[command]npm run build"
+          npm run build
+        displayName: Configure NPM
+        workingDirectory: $(Build.Repository.LocalPath)
+      
+      - task: CopyFiles@2
+        inputs:
+          sourceFolder:  $(Build.Repository.LocalPath)
+          Contents: |
+            *.js
+            *.ts
+            *.html      
+          targetFolder: '$(Build.ArtifactStagingDirectory)'
+          cleanTargetFolder: false
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      
+      - task: ArchiveFiles@2
+        inputs:
+            rootFolderOrFile: $(Build.ArtifactStagingDirectory)
+            archiveType: 'zip'
+            archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+            includeRootFolder: false
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            
+      - task: Docker@2
+        displayName: Login to ACR
+        inputs:
+          command: login
+          containerRegistry: $(dockerReg-nonprod)
+      - task: Docker@2
+        displayName: Build image
+        inputs:
+          command: build
+          containerRegistry: $(dockerReg-nonprod)
+          repository: $(imageName)
+          Dockerfile: $(dockerfile)
+          buildContext: $(Build.Repository.LocalPath)
+          tags: |
+            $(imageTag)
+            latest
+          arguments: --secret id=npmrc,src=/home/vsts/.npmrc
+        env:
+          DOCKER_BUILDKIT: 1
+      - task: Docker@2
+        displayName: Push image to container registry
+        inputs:
+          command: push
+          containerRegistry: $(dockerReg-nonprod)
+          repository: $(imageName)
+          Dockerfile: $(dockerfile)
+          buildContext: $(Build.Repository.LocalPath)
+          tags: |
+            $(imageTag)
+            latest
+      - task: ArchiveFiles@2
+        inputs:
+            rootFolderOrFile: '$(Build.SourcesDirectory)/src'
+            archiveType: 'zip'
+            archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.Sources).zip'
+            includeRootFolder: false
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      
+      - task: Veracode@3
+        inputs:
+          ConnectionDetailsSelection: 'Endpoint'
+          AnalysisService: 'AzureAPI - Veracode'
+          veracodeAppProfile: '$(System.TeamProject)/$(Build.Repository.Name)'
+          version: '$(System.TeamProject)-$(Build.Repository.Name)-$(Build.SourceBranchName)-$(build.buildNumber)'
+          filepath: '$(Build.ArtifactStagingDirectory)/$(Build.Sources).zip'
+          maximumWaitTime: '360'
+      - template: Step-AquaSecurity.yml@templates
+        parameters:
+          aquaimage: '$(dockerReg-login-server)/$(imageName):$(info.version)' #full name of container image:tag(version)
+          aquaregistry: 'gehadev.azurecr.io' #name of docker registry for Aqua to pull image
+          aquatoken: '$(aquaToken)'
+
+- template: Kubernetes/Deploy-Stages.yml@templates
