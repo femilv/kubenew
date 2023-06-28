@@ -1,0 +1,170 @@
+#Update AKS
+#Inputs resourceGroup, aksClusterName, targetEnv, image_repo
+stages:
+  - stage: AKS_${{ parameters.envShortHand }}
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs: 
+    - ${{ if eq(parameters.envShortHand, 'prod') }}:
+      - deployment: predeploy_PRD
+        displayName: Push to PROD container registry
+        environment: ${{ parameters.targetEnv }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - task: Docker@2
+                displayName: Login to NonProd ACR
+                inputs:
+                  command: login
+                  containerRegistry: $(dockerReg-nonprod)    
+              - task: Docker@2
+                displayName: Login to Prod ACR
+                inputs:
+                  command: login
+                  containerRegistry: $(dockerReg-prod)
+              # Handles pull and retagging the dev image and pushing to prod ACR
+              # Promotes container to prod ACR
+              - task: AzureCLI@2
+                displayName: Prod ACR Import
+                inputs:
+                  azureSubscription: 'GEHA Containers'
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -x
+                    sleep 25
+                    az acr import \
+                    --name gehaprd \
+                    --source gehadev.azurecr.io/$(imageName):$(imageTag) \
+                    --image $(imageName):$(imageTag) --force                     
+    - deployment: deploy_AKS_${{ parameters.envShortHand }}
+      displayName: Deploy container to ${{ parameters.aksClusterName }}
+      # If deploying to Prod, then wait for container promotion job above.
+      ${{ if eq(parameters.aksClusterName, 'geha-prd-aks')}}:
+        dependsOn: predeploy_PRD 
+      environment: ${{ parameters.targetEnv }}
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: templates
+            - checkout: self
+              path: s/self
+            - powershell: |
+                if ("$(appName)" -like "*.*" -or "$(appName)" -like "*_*") {
+                  Write-Host "##vso[task.logissue type=error]appName variable must not contain underscores or periods."
+                  Exit 1
+                }
+                $appName = "$(appName)".ToLower()
+                Write-Host $appName
+                Write-Host "##vso[task.setvariable variable=appName;isOutput=true]$appName"
+              name: appNameValidation
+            - powershell: |
+                $imagePath = "${{ parameters.image_repo }}" + ".azurecr.io/" + "$(imageName)" + ":" + "$(imageTag)"
+                Write-Host $imagePath
+                Write-Host "##vso[task.setvariable variable=imagePath;isOutput=true]$imagePath"
+              name: GetImageName
+            - script: pip install -r $(Build.SourcesDirectory)/BuildTemplates/Kubernetes/requirements.txt
+              displayName: 'Install Build Render Requirements' 
+            - task: PowerShell@2
+              inputs:
+                targetType: 'inline'
+                workingDirectory: $(Build.SourcesDirectory)/self
+                script: |
+                  python "$(Build.SourcesDirectory)/BuildTemplates/Kubernetes/RenderApplicationResource.py" |
+                    Tee-Object "$(Build.ArtifactStagingDirectory)/application.yaml" 
+              displayName: 'Render Pipeline Application' 
+              env:
+                APPLICATION_NAME:         $(appNameValidation.appName)
+                APPLICATION_ENVIRONMENT:  ${{ parameters.envShortHand }}
+                CLUSTER_NAME:             ${{parameters.aksClusterName}}
+                APPLICATION_CLUSTER_HOST: aks
+                BUILD_CONFIG_PATH:        ${{ parameters.buildConfig }}
+                VALUES_FILE_PATH:         ${{ parameters.valuesFile }}
+                TEAMS_PROJECT:            $(System.TeamProject)
+                HELM_PARAM_image_tag:     $(imageTag)
+                HELM_PARAM_image_name:    $(imageName)
+                # Build Number used to identify build and job attempt - as well as force a deployment/pod restart
+                # Since adding a helm parameter or value will force a new deployment in ArgoCD
+                HELM_PARAM_build_number:  $(Build.BuildNumber)-$(System.JobAttempt)
+            - task: PublishPipelineArtifact@1
+              inputs:
+                targetPath: $(Build.ArtifactStagingDirectory)/application.yaml
+                artifactName: ${{ parameters.envShortHand }}-ApplicationManifest-$(System.JobAttempt)
+
+            - task: AzureCLI@2
+              displayName: AKS Deployment
+              inputs:
+                workingDirectory: $(Build.ArtifactStagingDirectory)
+                azureSubscription: GEHA Containers
+                scriptType: pscore
+                scriptLocation: inlineScript
+                failOnStandardError: true
+                inlineScript: |
+                  # RESOURCE_GROUP= ${{parameters.resourceGroup}}
+                  # AKS_CLUSTER_NAME= ${{parameters.aksClusterName}}
+                  # APP_NAMESPACE=member-portal
+                  # DEPLOYMENT_VERSION=deployment.v1.apps
+                  # DEPLOYMENT_NAME=member-portal-deployment
+                  # CONTAINER_NAME=deployment
+                  # APP_IMAGE=<version>
+
+                  $command = "kubectl describe deployments -n=$(appNameValidation.appName) $(appNameValidation.appName)-deployment"
+                  Write-Host "##[command]$command"
+                  $result = az aks command invoke `
+                    --resource-group ${{ parameters.resourceGroup }} `
+                    --name ${{parameters.aksClusterName}} `
+                    --command $command
+                  
+                  Write-Host "AKS Command Result:"
+                  $result | Out-String
+
+                  if($res | %{ 'not found' -match $_ } | ?{$_}){
+                    Write-Host "##[warning]No prior rollout found."  
+                  } else {
+                    $previous = ($result | Select-String -pattern '\s+Image:\s+(.+)').matches.groups[1].Value
+                    Write-Host "##[warning]Previous Image: $previous"  
+                  }
+
+                  # Apply New Application File
+                  $command = "kubectl apply -f `"application.yaml`" -n=argocd"
+                  Write-Host "##[command]$command"
+                  az aks command invoke `
+                    --resource-group ${{ parameters.resourceGroup }} `
+                    --name ${{ parameters.aksClusterName }} `
+                    --command $command `
+                    --file application.yaml
+
+                  # Wait for Deployment
+                  $command = "kubectl rollout status -n=$(appNameValidation.appName) " +
+                    "deployment/$(appNameValidation.appName)-deployment"
+                  Write-Host "##[command]$command"    
+                  az aks command invoke `
+                    --resource-group ${{ parameters.resourceGroup }} `
+                    --name ${{ parameters.aksClusterName }} `
+                    --command $command
+
+                  # Verify Image Updated  
+                  $command = "kubectl describe deployments -n=$(appNameValidation.appName)"
+                  Write-Host "##[command]$command"
+                  $result = az aks command invoke `
+                    --resource-group ${{ parameters.resourceGroup }} `
+                    --name ${{parameters.aksClusterName}} `
+                    --command $command
+                  $result | Out-String 
+                  $new = ($result | Select-String -pattern '\s+Image:\s+(.+)').matches.groups[1].Value
+                  if($new -eq "$(GetImageName.imagePath)"){Write-Host "##[warning]New Image: $new" }
+                  else{ Write-Host "##[warning]Deployment Error: Deployed Version: $new does not match build version $(GetImageName.imagePath)" }
+            - task: PowerShell@2
+              displayName: 'Display Link to Splunk Logs' 
+              inputs:
+                targetType: 'inline'
+                workingDirectory: $(Build.SourcesDirectory)/self
+                script: |
+                  python "$(Build.SourcesDirectory)/BuildTemplates/Kubernetes/DisplaySplunkQuery.py"
+              env:
+                aksClusterName: ${{ parameters.aksClusterName }}
+                appName:        $(appNameValidation.appName)
+                imageRepo:      ${{ parameters.image_repo }}
+                imageName:      $(imageName)
+                imageTag:       $(imageTag)
